@@ -1,0 +1,125 @@
+# ─────────────────────────────────────────────────────────────
+#  sNuse ships to buyers, so this file assumes the worst case:
+#  the working copy has been pointed at a real phone and a real
+#  inbox. Anything that could carry a credential, an ADB key, a
+#  session, or a person's message text is ignored by default.
+#
+#  Runtime artifacts deliberately live OUTSIDE the repo, in
+#  ~/.android-driver/ (config.json, state/, shots/, last-ui.json),
+#  so a normal run never dirties this tree at all.
+#
+#  Note: .gitignore does NOT remove anything already committed.
+#  History is the actual guarantee — this repo is one squashed
+#  commit, created from a tree that was swept before it was made.
+# ─────────────────────────────────────────────────────────────
+
+# ── Credentials and keys ─────────────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.cer
+*.crt
+secrets.*
+*secret*
+credential*
+*credential*
+creds*
+*creds*
+login.json
+accounts.json
+passwords*
+*.kdbx
+*.1pux
+credentials*
+client_secret*.json
+service-account*.json
+token
+token.*
+*.token
+*_token
+auth.json
+*.session
+session.json
+.netrc
+.msmtprc
+cookies.txt
+*.cookie
+
+# ── adb: the private key is full shell access to a phone ─────
+.android/
+adbkey
+adbkey.pub
+adb_known_hosts*
+known_hosts
+
+# ── SSH ──────────────────────────────────────────────────────
+.ssh/
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+
+# ── Tailscale and other network credentials ──────────────────
+# auth keys look like tskey-auth-…; node state carries the private key
+tskey*
+*.tskey
+tailscale*.json
+tailscaled.state
+*.tsnet*
+
+# ── Polar / storefront ───────────────────────────────────────
+polar_token
+polar_oat_*
+.config/polar/
+.config/gh/
+.config/snail3d/
+
+# ── Phone and messaging state ────────────────────────────────
+# the ledger holds buyer names, message text and replies
+config.json
+state/
+last-ui.json
+dumps/
+snapshots/
+*.uix
+*.xml
+*.apk
+
+# ── Snapshots: a phone screenshot is message text ────────────
+shots/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.heic
+
+# ── Logs and crash output ────────────────────────────────────
+*.log
+logs/
+*.crash
+core
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+
+# ── Editors and OS ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+*.orig
+*.rej
+*.bak
+*.bak.*

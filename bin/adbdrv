@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+adbdrv — drive an Android phone over adb, from the Mac.
+
+See-and-act loop for AI agents (pi / Hermes / anything that can run a shell):
+
+    adbdrv status              # is the phone there, unlocked, what app is up
+    adbdrv connect             # wireless adb (address from config, or Tailscale)
+    adbdrv ui                  # snapshot: every visible element as text
+    adbdrv ui --text           # just the words on screen (reading messages)
+    adbdrv tap "Marketplace"   # act by what the button SAYS
+    adbdrv type "hello"        # unicode-safe text entry
+    adbdrv shot -o /tmp/x.png  # look at it with your own eyes
+    adbdrv wait "Sent" 20      # verify the result
+
+Invariant, same as SnCUA on the Macs: snapshot -> act -> verify from fresh
+state. Never chain taps from memory; the tree moves.
+
+Selectors:  "some text"  |  id:com.pkg:id/name  |  desc:content-description
+            @3 (index from the last `adbdrv ui`)  |  540,1200 (raw pixels)
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+CFG_DIR = os.path.expanduser("~/.android-driver")
+CFG = os.path.join(CFG_DIR, "config.json")
+STATE = os.path.join(CFG_DIR, "last-ui.json")
+SHOTS = os.path.join(CFG_DIR, "shots")
+
+_TARGET = None
+
+# ADBKeyboard is the only way to type unicode/emoji over adb. It must be the
+# *active* IME while the broadcast lands, which is why type_text swaps it in and
+# straight back out - leaving it selected would give the user a blank keyboard.
+ADB_IME = "com.android.adbkeyboard/.AdbIME"
+
+KEYMAP = {
+    "back": "KEYCODE_BACK", "home": "KEYCODE_HOME", "recents": "KEYCODE_APP_SWITCH",
+    "enter": "KEYCODE_ENTER", "power": "KEYCODE_POWER", "wake": "KEYCODE_WAKEUP",
+    "sleep": "KEYCODE_SLEEP", "menu": "KEYCODE_MENU", "del": "KEYCODE_DEL",
+    "tab": "KEYCODE_TAB", "esc": "KEYCODE_ESCAPE", "up": "KEYCODE_DPAD_UP",
+    "down": "KEYCODE_DPAD_DOWN", "left": "KEYCODE_DPAD_LEFT", "right": "KEYCODE_DPAD_RIGHT",
+    "search": "KEYCODE_SEARCH", "play": "KEYCODE_MEDIA_PLAY_PAUSE",
+    "volume_up": "KEYCODE_VOLUME_UP", "volume_down": "KEYCODE_VOLUME_DOWN",
+}
+
+# ---------------------------------------------------------------- adb plumbing
+
+
+def cfg():
+    try:
+        with open(CFG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cfg(d):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(CFG, "w") as f:
+        json.dump(d, f, indent=2)
+
+
+def adb(*args, serial=None, binary=False, check=True, timeout=60):
+    cmd = ["adb"]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += list(args)
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if check and r.returncode != 0:
+        err = (r.stderr or b"").decode(errors="replace").strip()
+        raise SystemExit(f"adb failed: {' '.join(cmd)}\n{err}")
+    return r.stdout if binary else (r.stdout or b"").decode(errors="replace")
+
+
+def device_list():
+    """Online devices, with the identity fields needed to spot a duplicate."""
+    out = adb("devices", "-l", check=False)
+    devs = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        model = next((p.split(":", 1)[1] for p in parts if p.startswith("model:")), "")
+        devs.append({
+            "serial": serial,
+            "state": state,
+            "model": model,
+            "usb": any(p.startswith("usb:") for p in parts),
+            "tcp": ":" in serial,
+        })
+    return devs
+
+
+def target():
+    """Which transport to use.
+
+    The same phone often shows up twice — once over USB and once over the network
+    (adb tcpip 5555) — and then every command dies with 'more than one
+    device/emulator'. Collapse those into one pick: prefer USB, whose serial does
+    not change when the phone's IP does.
+    """
+    global _TARGET
+    if os.environ.get("ADBDRV_SERIAL"):
+        return os.environ["ADBDRV_SERIAL"]
+    if _TARGET:
+        return _TARGET
+    devs = [d for d in device_list() if d["state"] == "device"]
+    if not devs:
+        raise SystemExit(
+            "No phone.\n"
+            "  wireless: adb connect <ip>:5555   (see the android-phone skill)\n"
+            "  usb:      plug it in and accept the 'Allow USB debugging' prompt"
+        )
+    usb = [d for d in devs if d["usb"]]
+    _TARGET = usb[0]["serial"] if usb else devs[0]["serial"]
+    return _TARGET
+
+
+def sh(cmd, serial=None, check=True, timeout=60):
+    # Every shell command needs a target; resolve it once and cache it.
+    return adb("shell", cmd, serial=serial or target(), check=check, timeout=timeout)
+
+
+# --------------------------------------------------------------------- screen
+
+
+def screen_size(serial=None):
+    m = re.search(r"(\d+)x(\d+)", sh("wm size", serial=serial))
+    return (int(m.group(1)), int(m.group(2))) if m else (1080, 2400)
+
+
+def dump_xml(serial=None, retries=3):
+    """Pull the accessibility tree. Retries: uiautomator is flaky right after a tap."""
+    serial = serial or target()
+    last = ""
+    for _ in range(retries):
+        r = subprocess.run(["adb", "-s", serial, "shell",
+                            "uiautomator dump --compressed /sdcard/adbdrv.xml"],
+                           capture_output=True)
+        err = (r.stderr or b"").decode(errors="replace")
+        if "more than one device" in err:
+            raise SystemExit(err.strip())          # a selection problem, not a lock
+        if "ERROR: could not get idle state" in err:
+            time.sleep(1.0)                        # animation; wait, don't fail
+        xml = adb("exec-out", "cat /sdcard/adbdrv.xml", serial=serial, check=False)
+        if "<hierarchy" in xml:
+            return xml
+        last = (xml or err).strip()
+        time.sleep(0.6)
+    raise SystemExit(
+        "Couldn't read the screen. Usually the phone is locked, or a secure "
+        f"window (banking/password) is up.\n{last[:200]}"
+    )
+
+
+def parse(xml, pw=None, ph=None):
+    """Flat list of visible elements, each with its centre point in real pixels."""
+    pw = pw or screen_size()[0]
+    ph = ph or screen_size()[1]
+    root = ET.fromstring(xml)
+    nodes = []
+    for n in root.iter("node"):
+        a = n.attrib
+        b = a.get("bounds") or ""
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+        if not m:
+            continue
+        x1, y1, x2, y2 = map(int, m.groups())
+        if x2 - x1 <= 0 or y2 - y1 <= 0:
+            continue
+        nodes.append({
+            "text": (a.get("text") or "").strip(),
+            "desc": (a.get("content-desc") or "").strip(),
+            "rid": a.get("resource-id") or "",
+            "cls": (a.get("class") or "").split(".")[-1],
+            "pkg": a.get("package") or "",
+            "bounds": [x1, y1, x2, y2],
+            "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+            "clickable": a.get("clickable") == "true",
+            "scrollable": a.get("scrollable") == "true",
+            "checked": a.get("checked") == "true",
+            "focused": a.get("focused") == "true",
+            "enabled": a.get("enabled") == "true",
+            "pwd": a.get("password") == "true",
+        })
+    return nodes
+
+
+def snapshot(serial=None):
+    xml = dump_xml(serial=serial)
+    nodes = parse(xml)
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(nodes, f)
+    return nodes
+
+
+def resolve(sel, nodes=None, serial=None):
+    """Turn a human selector into a tap point. Exact matches beat substrings."""
+    if re.fullmatch(r"\d+\s*,\s*\d+", sel):
+        x, y = (int(v) for v in sel.split(","))
+        return x, y, "coords"
+    if sel.startswith("@"):
+        nodes = json.load(open(STATE)) if os.path.exists(STATE) else snapshot(serial)
+        i = int(sel[1:])
+        if not 0 <= i < len(nodes):
+            raise SystemExit(f"{sel} out of range (last snapshot had {len(nodes)} elements)")
+        n = nodes[i]
+        return n["center"][0], n["center"][1], f"@ {n['text'] or n['desc'] or n['cls']}"
+
+    nodes = nodes if nodes is not None else snapshot(serial)
+    key, val = None, sel
+    for pre, k in (("id:", "rid"), ("desc:", "desc"), ("text:", "text")):
+        if sel.startswith(pre):
+            key, val = k, sel[len(pre):]
+            break
+    low = val.lower()
+
+    def score(n):
+        t, d, r = n["text"].lower(), n["desc"].lower(), n["rid"]
+        if key == "rid":
+            hit = r == val or r.endswith(val)
+        elif key == "desc":
+            hit = d == low or low in d
+        elif key == "text":
+            hit = t == low or low in t
+        else:
+            hit = low in t or low in d or low in r.lower()
+        if not hit:
+            return None
+        return (0 if (t == low or d == low) else 1, 0 if n["clickable"] else 1,
+                0 if n["enabled"] else 1, len(t) or len(d))
+
+    cands = [(score(n), n) for n in nodes]
+    cands = [(s, n) for s, n in cands if s]
+    if not cands:
+        visible = " | ".join(sorted({n["text"] or n["desc"] for n in nodes if n["text"] or n["desc"]})[:40])
+        raise SystemExit(f"Nothing on screen matches {sel!r}.\nVisible: {visible}")
+    cands.sort(key=lambda p: p[0])
+    best = cands[0][1]
+    return best["center"][0], best["center"][1], f"{best['cls']} {best['text'] or best['desc']!r}"
+
+
+def tap_xy(x, y, serial=None):
+    sh(f"input tap {x} {y}", serial=serial)
+
+
+def type_text(text, serial=None):
+    """Type into the focused field.
+
+    Unicode-safe via ADBKeyboard (switched in for the duration, then the user's
+    own keyboard is restored). Falls back to `input text`, which silently drops
+    anything outside ASCII.
+    """
+    serial = serial or target()
+    installed = "adbkeyboard" in sh("pm list packages com.android.adbkeyboard",
+                                    serial=serial, check=False)
+    if not installed:
+        ascii_text = "".join(c for c in text.replace(" ", "%s") if ord(c) < 128)
+        sh("input text " + shell_quote(ascii_text), serial=serial)
+        return ("input-text (ASCII ONLY - non-ASCII dropped; install ADBKeyboard: "
+                "com.android.adbkeyboard)")
+
+    prev = sh("settings get secure default_input_method", serial=serial).strip()
+    switched = prev != ADB_IME
+    if switched:
+        sh(f"ime enable {ADB_IME}", serial=serial, check=False)
+        sh(f"ime set {ADB_IME}", serial=serial, check=False)
+        time.sleep(0.8)
+    # B64 carries every codepoint; ADB_INPUT_TEXT mangles some.
+    sh(f"am broadcast -a ADB_INPUT_B64 --es msg "
+       f"{base64.b64encode(text.encode()).decode('ascii')}", serial=serial)
+    time.sleep(0.5)
+    if switched:
+        sh(f"ime set {prev}", serial=serial, check=False)
+    return "ADBKeyboard (unicode)" + (f", keyboard restored to {prev.split('/')[0]}" if switched else "")
+
+
+def shell_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_status(a):
+    s = target()
+    model = sh("getprop ro.product.model", serial=s, check=False).strip()
+    rel = sh("getprop ro.build.version.release", serial=s, check=False).strip()
+    sdk = sh("getprop ro.build.version.sdk", serial=s, check=False).strip()
+    w, h = screen_size(serial=s)
+    batt = sh("dumpsys battery", serial=s, check=False)
+    lvl = re.search(r"level:\s*(\d+)", batt)
+    chg = "charging" if re.search(r"AC powered: true|USB powered: true", batt) else "on battery"
+    awake = "awake" if "mWakefulness=Awake" in sh("dumpsys power", serial=s, check=False) else "asleep"
+    locked = bool(re.search(r"mDreamingLockscreen=true|showing=true",
+                            sh("dumpsys window", serial=s, check=False)))
+    fg = sh("dumpsys window", serial=s, check=False)
+    m = re.search(r"mCurrentFocus=Window\{[^}]*\s([\w.]+)/([\w.$]+)", fg) or \
+        re.search(r"topResumedActivity.*?([\w.]+)/([\w.$]+)", sh("dumpsys activity activities", serial=s, check=False))
+    others = [d for d in device_list() if d["state"] == "device"]
+    if len(others) > 1:
+        print(f"note      {len(others)} transports for this phone: "
+              f"{', '.join(d['serial'] for d in others)} (using {s})")
+    print(f"serial    {s}")
+    print(f"device    {model}  (Android {rel}, sdk {sdk})")
+    print(f"screen    {w}x{h}   {awake}   {'LOCKED' if locked else 'unlocked'}")
+    print(f"battery   {lvl.group(1) if lvl else '?'}%  {chg}")
+    print(f"app       {m.group(1) if m else '?'}")
+    if sh("pm list packages com.android.adbkeyboard", serial=s, check=False).strip():
+        print("unicode   ADBKeyboard present - full text + emoji")
+    else:
+        print("unicode   no ADBKeyboard - ascii only (see skill: install it)")
+
+
+def cmd_connect(a):
+    c = cfg()
+    addr = a.address or c.get("address")
+    if not addr:
+        ts = shutil.which("tailscale") or "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        name = c.get("tailscale_name", "")
+        if not name:
+            raise SystemExit("No address. adbdrv connect <ip>:5555 once, it is remembered.")
+        if os.path.exists(ts):
+            ip = subprocess.run([ts, "ip", "-4"], capture_output=True).stdout.decode().strip()
+            peer = subprocess.run([ts, "status"], capture_output=True).stdout.decode()
+            m = re.search(rf"([\d.]+)\s+{re.escape(name)}", peer)
+            if m:
+                addr = f"{m.group(1)}:5555"
+                print(f"phone not reachable on LAN -> Tailscale address {addr}")
+        if not addr:
+            raise SystemExit("No address. adbdrv connect <ip:5555> once, it's remembered.")
+    out = adb("connect", addr, check=False)
+    if "connected" not in out and "already" not in out:
+        raise SystemExit(out.strip() + "\n\nWireless debugging off? On the phone: "
+                         "Settings > Developer options > Wireless debugging > ON.\n"
+                         "First time only: 'Pair device with pairing code' -> "
+                         "adbdrv pair <ip:port> <6-digit code>")
+    c["address"] = addr
+    save_cfg(c)
+    print(f"connected {addr}  ({len([l for l in adb('devices').splitlines() if chr(9)+'device' in l])} device(s))")
+
+
+def cmd_pair(a):
+    ip, _, port = a.address.rpartition(":")
+    out = adb("pair", a.address, a.code, check=False)
+    print(out.strip())
+    if "Successfully paired" in out:
+        host = ip or a.address
+        c = cfg()
+        c["address"] = f"{host}:5555"
+        save_cfg(c)
+        print(f"remembered {c['address']} - now: adbdrv connect")
+
+
+def cmd_disconnect(a):
+    print(adb("disconnect", check=False).strip() or "disconnected")
+
+
+def cmd_ui(a):
+    nodes = snapshot()
+    if a.json:
+        print(json.dumps(nodes, indent=1))
+        return
+    if a.text:
+        seen, lines = set(), []
+        for n in nodes:
+            for v in (n["text"], n["desc"]):
+                if v and v not in seen:
+                    seen.add(v)
+                    lines.append(v)
+        print("\n".join(lines))
+        return
+    for i, n in enumerate(nodes):
+        label = n["text"] or n["desc"] or f"<{n['cls']}>"
+        flags = "".join(c for c, on in
+                        (("C", n["clickable"]), ("S", n["scrollable"]), ("F", n["focused"]),
+                         ("X", not n["enabled"]), ("P", n["pwd"])) if on)
+        if a.all:
+            print(f"[{i:3}] {label[:90]:92} {n['cls'][:18]:20} {flags:4} {n['bounds']}")
+        elif n["clickable"] or n["text"] or n["desc"] or n["scrollable"]:
+            print(f"[{i:3}] {label[:90]:92} {n['cls'][:18]:20} {flags}")
+    print(f"\n{len(nodes)} elements   tap one with:  adbdrv tap @<n>   or   adbdrv tap \"<its text>\"")
+
+
+def cmd_find(a):
+    nodes = snapshot()
+    low = a.text.lower()
+    hits = [n for n in nodes if low in n["text"].lower() or low in n["desc"].lower()]
+    for n in hits:
+        print(f"{n['text'] or n['desc']}   @ {n['center']}   {n['cls']}")
+    if not hits:
+        print(f"no match for {a.text!r}")
+        return 1
+    return 0
+
+
+def cmd_tap(a):
+    x, y, why = resolve(a.selector)
+    tap_xy(x, y)
+    print(f"tapped {x},{y}  ({why})")
+    if a.then_wait:
+        time.sleep(a.then_wait)
+
+
+def cmd_long(a):
+    x, y, why = resolve(a.selector)
+    sh(f"input swipe {x} {y} {x} {y} {a.ms}")
+    print(f"long-pressed {x},{y} ({a.ms}ms)  ({why})")
+
+
+def cmd_swipe(a):
+    p = lambda s: [int(v) for v in s.split(",")]
+    x1, y1 = p(a.start)
+    x2, y2 = p(a.end)
+    sh(f"input swipe {x1} {y1} {x2} {y2} {a.ms}")
+    print(f"swiped {x1},{y1} -> {x2},{y2} in {a.ms}ms")
+
+
+def cmd_scroll(a):
+    w, h = screen_size()
+    x = w // 2
+    d = {"down": (int(h * .72), int(h * .28)), "up": (int(h * .28), int(h * .72)),
+         "top": (int(h * .72), int(h * .15)), "bottom": (int(h * .15), int(h * .72)),
+         "next": (int(h * .72), int(h * .28))}[a.direction]
+    sh(f"input swipe {x} {d[0]} {x} {d[1]} {a.ms}")
+    print(f"scrolled {a.direction}")
+
+
+def cmd_type(a):
+    how = type_text(a.text)
+    print(f"typed via {how}")
+
+
+def cmd_key(a):
+    name = a.name.lower()
+    code = KEYMAP.get(name) or (name.upper() if name.startswith("keycode_") else f"KEYCODE_{name.upper()}")
+    sh(f"input keyevent {code}")
+    print(f"sent {code}")
+
+
+def cmd_open(a):
+    what = a.target
+    if what.startswith("http") or "://" in what:
+        sh(f'am start -a android.intent.action.VIEW -d "{what}"')
+    elif "/" in what:
+        sh(f"am start -n {what}")
+    else:
+        sh(f"monkey -p {what} -c android.intent.category.LAUNCHER 1")
+    print(f"opened {what}")
+    time.sleep(a.then_wait)
+
+
+def cmd_fg(a):
+    out = sh("dumpsys window")
+    m = re.search(r"mCurrentFocus=Window\{[^}]*\s([\w.]+)/([\w.$]+)", out)
+    if not m:
+        m = re.search(r"topResumedActivity.*?([\w.]+)/([\w.$]+)", sh("dumpsys activity activities"))
+    print(f"{m.group(1)}  {m.group(2)}" if m else "?")
+
+
+def cmd_wait(a):
+    deadline = time.time() + a.timeout
+    while time.time() < deadline:
+        try:
+            nodes = snapshot()
+        except SystemExit:
+            time.sleep(1)
+            continue
+        low = a.selector.lower()
+        for n in nodes:
+            if low in n["text"].lower() or low in n["desc"].lower():
+                print(f"found {a.selector!r} after {a.timeout - (deadline - time.time()):.1f}s")
+                return
+        time.sleep(1.5)
+    raise SystemExit(f"timed out after {a.timeout}s waiting for {a.selector!r}")
+
+
+def cmd_shot(a):
+    os.makedirs(SHOTS, exist_ok=True)
+    out = a.output or os.path.join(SHOTS, time.strftime("shot-%Y%m%d-%H%M%S.png"))
+    sh(f"rm -f /sdcard/adbdrv.png")
+    sh("screencap -p /sdcard/adbdrv.png")
+    data = adb("exec-out", "cat /sdcard/adbdrv.png", serial=target(), binary=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    print(out)
+
+
+def cmd_wake(a):
+    sh("input keyevent KEYCODE_WAKEUP")
+    time.sleep(0.4)
+    sh("wm dismiss-keyguard", check=False)
+    time.sleep(0.4)
+    w, h = screen_size()
+    sh(f"input swipe {w // 2} {int(h * .8)} {w // 2} {int(h * .2)} 200", check=False)
+    time.sleep(0.6)
+    print("awake" + ("" if a.quiet else " - if it's locked, Eric has to unlock it"))
+
+
+def cmd_push(a):
+    remote = a.remote or ("/sdcard/DCIM/" if a.dcim else "/sdcard/Download/")
+    adb("push", a.local, remote, serial=target())
+    dest = remote + os.path.basename(a.local)
+    sh(f'am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file://{dest}', check=False)
+    print(f"pushed to {dest} (gallery should see it)")
+
+
+def cmd_watch(a):
+    cmd = ["scrcpy", "-s", target(), "--stay-awake", "--no-audio"]
+    if a.virtual:
+        cmd += ["--new-display=1080x2400/420"]
+        if a.app:
+            cmd += [f"--start-app={a.app}"]
+    print(" ".join(cmd) + "   (quit with the window's close button)")
+    subprocess.run(cmd)
+
+
+def cmd_devices(a):
+    print(adb("devices", "-l").strip())
+
+
+def cmd_shell(a):
+    print(sh(" ".join(a.command)), end="")
+
+
+# ---------------------------------------------------------------------- main
+
+
+def main():
+    p = argparse.ArgumentParser(prog="adbdrv", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-s", "--serial", help="device serial (default: the only one)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="is the phone there / awake / unlocked / what app").set_defaults(fn=cmd_status)
+    c = sub.add_parser("connect", help="wireless adb connect"); c.add_argument("address", nargs="?"); c.set_defaults(fn=cmd_connect)
+    pr = sub.add_parser("pair", help="wireless adb pair (first time)"); pr.add_argument("address"); pr.add_argument("code"); pr.set_defaults(fn=cmd_pair)
+    sub.add_parser("disconnect").set_defaults(fn=cmd_disconnect)
+    sub.add_parser("devices", help="adb devices -l").set_defaults(fn=cmd_devices)
+
+    u = sub.add_parser("ui", help="snapshot the screen (see-and-act: step 1)")
+    u.add_argument("--text", action="store_true", help="just the words")
+    u.add_argument("--json", action="store_true")
+    u.add_argument("--all", action="store_true", help="include invisible layout junk")
+    u.set_defaults(fn=cmd_ui)
+
+    f = sub.add_parser("find", help="grep the screen"); f.add_argument("text"); f.set_defaults(fn=cmd_find)
+
+    t = sub.add_parser("tap", help="tap by text / id: / desc: / @n / x,y")
+    t.add_argument("selector"); t.add_argument("--then-wait", type=float, default=0.8); t.set_defaults(fn=cmd_tap)
+
+    l = sub.add_parser("long", help="long-press"); l.add_argument("selector"); l.add_argument("--ms", type=int, default=900); l.set_defaults(fn=cmd_long)
+
+    s = sub.add_parser("swipe"); s.add_argument("start"); s.add_argument("end"); s.add_argument("--ms", type=int, default=300); s.set_defaults(fn=cmd_swipe)
+
+    sc = sub.add_parser("scroll"); sc.add_argument("direction", choices=["down", "up", "top", "bottom", "next"]); sc.add_argument("--ms", type=int, default=320); sc.set_defaults(fn=cmd_scroll)
+
+    ty = sub.add_parser("type", help="type text into the focused field"); ty.add_argument("text"); ty.set_defaults(fn=cmd_type)
+
+    k = sub.add_parser("key", help="back/home/recents/enter/power..."); k.add_argument("name"); k.set_defaults(fn=cmd_key)
+
+    o = sub.add_parser("open", help="open a url, package, or activity"); o.add_argument("target"); o.add_argument("--then-wait", type=float, default=2.0); o.set_defaults(fn=cmd_open)
+
+    sub.add_parser("fg", help="foreground app").set_defaults(fn=cmd_fg)
+
+    w = sub.add_parser("wait", help="block until text appears (verify step)"); w.add_argument("selector"); w.add_argument("timeout", nargs="?", type=float, default=20); w.set_defaults(fn=cmd_wait)
+
+    sh_ = sub.add_parser("shot", help="screenshot"); sh_.add_argument("-o", "--output"); sh_.set_defaults(fn=cmd_shot)
+
+    sub.add_parser("wake", help="wake + try to get past the lock screen").set_defaults(fn=cmd_wake)
+
+    pu = sub.add_parser("push", help="send a file to the phone's gallery/downloads"); pu.add_argument("local"); pu.add_argument("remote", nargs="?"); pu.add_argument("--dcim", action="store_true"); pu.set_defaults(fn=cmd_push)
+
+    wa = sub.add_parser("watch", help="mirror the phone to a window (or a hidden virtual display)")
+    wa.add_argument("--virtual", action="store_true", help="don't take over the real screen")
+    wa.add_argument("--app", help="package to launch on the virtual display")
+    wa.set_defaults(fn=cmd_watch)
+
+    sl = sub.add_parser("shell"); sl.add_argument("command", nargs=argparse.REMAINDER); sl.set_defaults(fn=cmd_shell)
+
+    a = p.parse_args()
+    if a.serial:
+        os.environ["ADBDRV_SERIAL"] = a.serial
+    try:
+        rc = a.fn(a)
+        sys.exit(rc or 0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("adb timed out - phone asleep or off the network?")
+
+
+if __name__ == "__main__":
+    main()
